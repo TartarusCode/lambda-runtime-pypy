@@ -1,53 +1,75 @@
 #!/opt/pypy/bin/pypy
 
 import decimal
+import http.client
+import importlib
 import json
 import logging
 import os
-import site
+import signal
+import socket
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple, Union
-import urllib.request as request
+import traceback
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-# Configure logging
+# Configure logging before importing helper modules.
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=os.getenv("PYPY_RUNTIME_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Constants
-RUNTIME_API_ENDPOINT = "2018-06-01/runtime"
+RUNTIME_API_ENDPOINT = "/2018-06-01/runtime"
 HANDLER = os.getenv("_HANDLER")
 RUNTIME_API = os.getenv("AWS_LAMBDA_RUNTIME_API")
+RUNTIME_CLIENT_TIMEOUT = float(os.getenv("PYPY_RUNTIME_API_TIMEOUT", "310"))
+POLL_RETRY_BACKOFF_SECONDS = float(os.getenv("PYPY_RUNTIME_POLL_BACKOFF", "0.25"))
 
-# Add PyPy paths to sys.path
-for path in ["/opt/pypy", "/opt/pypy/site-packages"]:
-    sys.path.insert(0, path)
-    site.addsitedir(path)
+SHUTDOWN_REQUESTED = False
+_COLD_START = True
 
-if "LAMBDA_TASK_ROOT" in os.environ:
-    sys.path.insert(0, os.environ["LAMBDA_TASK_ROOT"])
-    site.addsitedir(os.environ["LAMBDA_TASK_ROOT"])
+
+def _prepend_path(path: str) -> None:
+    if path and path not in sys.path:
+        sys.path.insert(0, path)
+
+
+for path in ("/opt/pypy", "/opt/pypy/site-packages", os.getenv("LAMBDA_TASK_ROOT")):
+    if path:
+        _prepend_path(path)
+
+try:
+    from lambda_runtime_pypy.init import run_configured_init_hooks
+    from lambda_runtime_pypy.logging import clear_context, set_context
+    from lambda_runtime_pypy.tracing import set_trace_id
+except ImportError:  # pragma: no cover - bootstrap must stay operable without helpers.
+    def run_configured_init_hooks(handler: Callable[..., Any]) -> None:
+        return None
+
+    def clear_context() -> None:
+        return None
+
+    def set_context(**_: Any) -> None:
+        return None
+
+    def set_trace_id(trace_id: Optional[str]) -> None:
+        if trace_id:
+            os.environ["_X_AMZN_TRACE_ID"] = trace_id
 
 
 class LambdaContext:
     """AWS Lambda execution context object."""
-    
-    def __init__(self, request_id: str, invoked_function_arn: str, 
-                 deadline_ms: Optional[str], trace_id: Optional[str]) -> None:
-        """
-        Initialize Lambda context.
-        
-        Args:
-            request_id: The request ID for this invocation
-            invoked_function_arn: The ARN of the invoked function
-            deadline_ms: The deadline in milliseconds
-            trace_id: The trace ID for X-Ray tracing
-        """
+
+    def __init__(
+        self,
+        request_id: str,
+        invoked_function_arn: Optional[str],
+        deadline_ms: Optional[str],
+        trace_id: Optional[str],
+    ) -> None:
         self.aws_request_id = request_id
-        self.deadline_ms = deadline_ms
+        self.deadline_ms = int(deadline_ms) if deadline_ms is not None else None
         self.function_name = os.getenv("AWS_LAMBDA_FUNCTION_NAME")
         self.function_version = os.getenv("AWS_LAMBDA_FUNCTION_VERSION")
         self.invoked_function_arn = invoked_function_arn
@@ -55,252 +77,235 @@ class LambdaContext:
         self.log_stream_name = os.getenv("AWS_LAMBDA_LOG_STREAM_NAME")
         self.memory_limit_in_mb = os.getenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
         self.trace_id = trace_id
-        
-        if self.trace_id is not None:
-            os.environ["_X_AMZN_TRACE_ID"] = self.trace_id
+        set_trace_id(trace_id)
 
-    def get_remaining_time_in_millis(self) -> Optional[float]:
-        """
-        Get remaining execution time in milliseconds.
-        
-        Returns:
-            Remaining time in milliseconds or None if deadline not set
-        """
-        if self.deadline_ms is not None:
-            return time.time() * 1000 - int(self.deadline_ms)
-        return None
+    def get_remaining_time_in_millis(self) -> Optional[int]:
+        """Return the remaining execution time in milliseconds."""
+        if self.deadline_ms is None:
+            return None
+        return max(0, self.deadline_ms - int(time.time() * 1000))
+
+
+class RuntimeApiClient:
+    """Small persistent client for the Lambda Runtime API."""
+
+    def __init__(self, runtime_api: str, timeout_seconds: float) -> None:
+        self.runtime_api = runtime_api
+        self.timeout_seconds = timeout_seconds
+        self._connection: Optional[http.client.HTTPConnection] = None
+
+    def _connect(self) -> http.client.HTTPConnection:
+        if self._connection is None:
+            self._connection = http.client.HTTPConnection(
+                self.runtime_api,
+                timeout=self.timeout_seconds,
+            )
+        return self._connection
+
+    def _reset(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[http.client.HTTPResponse, bytes]:
+        payload_headers = {"Connection": "keep-alive"}
+        if headers:
+            payload_headers.update(headers)
+
+        try:
+            connection = self._connect()
+            connection.request(method, path, body=body, headers=payload_headers)
+            response = connection.getresponse()
+            payload = response.read()
+        except (OSError, http.client.HTTPException, socket.timeout):
+            self._reset()
+            raise
+
+        if response.status >= 400:
+            self._reset()
+            raise RuntimeError(
+                "Runtime API request failed "
+                f"({method} {path} -> {response.status} {response.reason}): "
+                f"{payload.decode('utf-8', errors='replace')}"
+            )
+
+        return response, payload
+
+    def next_invocation(self) -> Tuple[str, Dict[str, Any], LambdaContext]:
+        response, payload = self._request("GET", f"{RUNTIME_API_ENDPOINT}/invocation/next")
+        request_id = response.getheader("Lambda-Runtime-Aws-Request-Id")
+        if not request_id:
+            raise RuntimeError("Runtime API did not include Lambda-Runtime-Aws-Request-Id")
+
+        context = LambdaContext(
+            request_id=request_id,
+            invoked_function_arn=response.getheader("Lambda-Runtime-Invoked-Function-Arn"),
+            deadline_ms=response.getheader("Lambda-Runtime-Deadline-Ms"),
+            trace_id=response.getheader("Lambda-Runtime-Trace-Id"),
+        )
+        event = json.loads(payload.decode("utf-8"))
+        return request_id, event, context
+
+    def post_init_error(self, error: Exception) -> None:
+        self._post_json(f"{RUNTIME_API_ENDPOINT}/init/error", error_payload(error))
+
+    def post_invocation_response(
+        self,
+        request_id: str,
+        handler_response: Union[bytes, str, Dict[str, Any]],
+    ) -> None:
+        if not isinstance(handler_response, (bytes, str)):
+            handler_response = json.dumps(handler_response, default=decimal_serializer)
+        if not isinstance(handler_response, bytes):
+            handler_response = handler_response.encode("utf-8")
+        self._request(
+            "POST",
+            f"{RUNTIME_API_ENDPOINT}/invocation/{request_id}/response",
+            body=handler_response,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def post_invocation_error(self, request_id: str, error: Exception) -> None:
+        self._post_json(
+            f"{RUNTIME_API_ENDPOINT}/invocation/{request_id}/error",
+            error_payload(error),
+        )
+
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> None:
+        self._request(
+            "POST",
+            path,
+            body=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+
+def handle_shutdown(signum: int, _frame: Any) -> None:
+    """Request a graceful shutdown after the current lifecycle step."""
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+    logger.info("Received signal %s; runtime will exit gracefully", signum)
+
+
+for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(shutdown_signal, handle_shutdown)
 
 
 def decimal_serializer(obj: Any) -> Union[float, Any]:
-    """
-    Serialize Decimal objects to float for JSON encoding.
-    
-    Args:
-        obj: Object to serialize
-        
-    Returns:
-        Serialized object
-        
-    Raises:
-        TypeError: If object is not JSON serializable
-    """
+    """Serialize Decimal objects for JSON encoding."""
     if isinstance(obj, decimal.Decimal):
         return float(obj)
     raise TypeError(f"{repr(obj)} is not JSON serializable")
 
 
-def init_error(message: str, error_type: str) -> None:
-    """
-    Report initialization error to Lambda runtime.
-    
-    Args:
-        message: Error message
-        error_type: Type of error
-    """
-    details = {"errorMessage": message, "errorType": error_type}
-    details_json = json.dumps(details).encode("utf-8")
-    
-    url = f"http://{RUNTIME_API}/{RUNTIME_API_ENDPOINT}/init/error"
-    req = request.Request(url, details_json, {"Content-Type": "application/json"})
-    
-    try:
-        with request.urlopen(req) as res:
-            res.read()
-    except Exception as e:
-        logger.error(f"Failed to report init error: {e}")
-
-
-def next_invocation() -> Tuple[str, Dict[str, Any], LambdaContext]:
-    """
-    Get the next invocation from Lambda runtime.
-    
-    Returns:
-        Tuple of (request_id, event, context)
-        
-    Raises:
-        Exception: If unable to get next invocation
-    """
-    url = f"http://{RUNTIME_API}/{RUNTIME_API_ENDPOINT}/invocation/next"
-    
-    try:
-        with request.urlopen(url) as res:
-            request_id = res.getheader("lambda-runtime-aws-request-id")
-            invoked_function_arn = res.getheader("lambda-runtime-invoked-function-arn")
-            deadline_ms = res.getheader("lambda-runtime-deadline-ms")
-            trace_id = res.getheader("lambda-runtime-trace-id")
-            event_payload = res.read()
-            
-        event = json.loads(event_payload.decode("utf-8"))
-        context = LambdaContext(request_id, invoked_function_arn, deadline_ms, trace_id)
-        return request_id, event, context
-        
-    except Exception as e:
-        logger.error(f"Failed to get next invocation: {e}")
-        raise
-
-
-def invocation_response(request_id: str, handler_response: Union[bytes, str, Dict[str, Any]]) -> None:
-    """
-    Send invocation response to Lambda runtime.
-    
-    Args:
-        request_id: The request ID
-        handler_response: The response from the handler function
-    """
-    if not isinstance(handler_response, (bytes, str)):
-        handler_response = json.dumps(handler_response, default=decimal_serializer)
-    if not isinstance(handler_response, bytes):
-        handler_response = handler_response.encode("utf-8")
-        
-    url = f"http://{RUNTIME_API}/{RUNTIME_API_ENDPOINT}/invocation/{request_id}/response"
-    req = request.Request(url, handler_response, {"Content-Type": "application/json"})
-    
-    try:
-        with request.urlopen(req) as res:
-            res.read()
-    except Exception as e:
-        logger.error(f"Failed to send invocation response: {e}")
-
-
-def invocation_error(request_id: str, error: Exception) -> None:
-    """
-    Send invocation error to Lambda runtime.
-    
-    Args:
-        request_id: The request ID
-        error: The exception that occurred
-    """
-    details = {"errorMessage": str(error), "errorType": type(error).__name__}
-    details_json = json.dumps(details).encode("utf-8")
-    
-    url = f"http://{RUNTIME_API}/{RUNTIME_API_ENDPOINT}/invocation/{request_id}/error"
-    req = request.Request(url, details_json, {"Content-Type": "application/json"})
-    
-    try:
-        with request.urlopen(req) as res:
-            res.read()
-    except Exception as e:
-        logger.error(f"Failed to send invocation error: {e}")
+def error_payload(error: Exception) -> Dict[str, Any]:
+    """Build the Lambda Runtime API error payload."""
+    return {
+        "errorMessage": str(error),
+        "errorType": type(error).__name__,
+        "stackTrace": traceback.format_exception(type(error), error, error.__traceback__),
+    }
 
 
 def validate_environment() -> None:
-    """
-    Validate required environment variables.
-    
-    Raises:
-        RuntimeError: If required environment variables are missing
-    """
+    """Validate required environment variables."""
     required_vars = ["AWS_LAMBDA_RUNTIME_API", "_HANDLER"]
-    missing_vars = [var for var in required_vars if var not in os.environ]
-    
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
     if missing_vars:
-        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
-        logger.error(error_msg)
-        init_error(error_msg, "RuntimeError")
-        sys.exit(1)
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing_vars)}"
+        )
 
 
 def parse_handler(handler: str) -> Tuple[str, str]:
-    """
-    Parse handler string into module path and handler name.
-    
-    Args:
-        handler: Handler string in format 'module.function'
-        
-    Returns:
-        Tuple of (module_path, handler_name)
-        
-    Raises:
-        ValueError: If handler format is invalid
-    """
-    try:
-        module_path, handler_name = handler.rsplit(".", 1)
-        if not module_path or not handler_name:
-            raise ValueError("Handler must contain both module and function name")
-        return module_path, handler_name
-    except ValueError as e:
-        error_msg = f"Invalid handler format '{handler}': {str(e)}"
-        logger.error(error_msg)
-        init_error(error_msg, "ValueError")
-        sys.exit(1)
+    """Parse handler string into module path and handler name."""
+    module_path, handler_name = handler.rsplit(".", 1)
+    if not module_path or not handler_name:
+        raise ValueError("Handler must contain both module and function name")
+    return module_path.replace("/", "."), handler_name
 
 
-def import_module(module_path: str) -> Any:
-    """
-    Import the specified module.
-    
-    Args:
-        module_path: Path to the module
-        
-    Returns:
-        The imported module
-        
-    Raises:
-        ImportError: If module cannot be imported
-    """
-    try:
-        return __import__(module_path)
-    except ImportError as e:
-        error_msg = f"Failed to import module '{module_path}': {str(e)}"
-        logger.error(error_msg)
-        init_error(error_msg, "ImportError")
-        sys.exit(1)
-
-
-def get_handler_function(module: Any, handler_name: str, module_path: str) -> Any:
-    """
-    Get the handler function from the module.
-    
-    Args:
-        module: The imported module
-        handler_name: Name of the handler function
-        module_path: Path of the module
-        
-    Returns:
-        The handler function
-        
-    Raises:
-        AttributeError: If handler function not found
-    """
-    try:
-        return getattr(module, handler_name)
-    except AttributeError as e:
-        error_msg = f"Handler '{handler_name}' not found in module '{module_path}': {str(e)}"
-        logger.error(error_msg)
-        init_error(error_msg, "AttributeError")
-        sys.exit(1)
+def load_handler(handler: str) -> Callable[[Dict[str, Any], LambdaContext], Any]:
+    """Import and return the configured handler function."""
+    module_path, handler_name = parse_handler(handler)
+    module = importlib.import_module(module_path)
+    function = getattr(module, handler_name)
+    if not callable(function):
+        raise TypeError(f"Configured handler '{module_path}.{handler_name}' is not callable")
+    logger.info("Handler loaded: %s.%s", module_path, handler_name)
+    return function
 
 
 def main() -> None:
-    """Main function to handle Lambda runtime loop."""
+    """Main function to handle the Lambda runtime lifecycle."""
+    global _COLD_START
+
     logger.info("Starting Lambda runtime")
-    
-    # Validate environment
-    validate_environment()
-    
-    # Parse handler
-    module_path, handler_name = parse_handler(HANDLER)
-    module_path = module_path.replace("/", ".")
-    
-    # Import module and get handler
-    module = import_module(module_path)
-    handler = get_handler_function(module, handler_name, module_path)
-    
-    logger.info(f"Handler loaded: {module_path}.{handler_name}")
-    
-    # Main runtime loop
-    while True:
+    client: Optional[RuntimeApiClient] = None
+
+    try:
+        validate_environment()
+        client = RuntimeApiClient(RUNTIME_API, RUNTIME_CLIENT_TIMEOUT)
+        handler = load_handler(HANDLER)
+        run_configured_init_hooks(handler)
+    except Exception as error:
+        logger.exception("Runtime initialization failed")
+        if client is None and RUNTIME_API:
+            client = RuntimeApiClient(RUNTIME_API, RUNTIME_CLIENT_TIMEOUT)
+        if client is not None:
+            try:
+                client.post_init_error(error)
+            except Exception:
+                logger.exception("Failed to report init error to Lambda")
+        raise SystemExit(1)
+
+    while not SHUTDOWN_REQUESTED:
+        request_id: Optional[str] = None
+
         try:
-            request_id, event, context = next_invocation()
-            logger.debug(f"Processing request: {request_id}")
-            
+            request_id, event, context = client.next_invocation()
+        except Exception:
+            if SHUTDOWN_REQUESTED:
+                break
+            logger.exception("Failed to get next invocation")
+            time.sleep(POLL_RETRY_BACKOFF_SECONDS)
+            continue
+
+        set_context(
+            aws_request_id=request_id,
+            cold_start=_COLD_START,
+            function_name=context.function_name,
+            function_version=context.function_version,
+            trace_id=context.trace_id,
+        )
+
+        try:
             handler_response = handler(event, context)
-            invocation_response(request_id, handler_response)
-            logger.debug(f"Request completed successfully: {request_id}")
-            
-        except Exception as e:
-            logger.error(f"Handler error: {e}")
-            invocation_error(request_id, e)
+        except Exception as error:
+            logger.exception("Handler execution failed for request %s", request_id)
+            try:
+                client.post_invocation_error(request_id, error)
+            except Exception:
+                logger.exception("Failed to send invocation error for request %s", request_id)
+        else:
+            try:
+                client.post_invocation_response(request_id, handler_response)
+            except Exception:
+                logger.exception(
+                    "Failed to send invocation response for request %s",
+                    request_id,
+                )
+        finally:
+            _COLD_START = False
+            clear_context()
+
+    logger.info("Lambda runtime shutdown complete")
 
 
 if __name__ == "__main__":

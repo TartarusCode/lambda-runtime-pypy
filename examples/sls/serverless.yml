@@ -1,4 +1,4 @@
-service: hello-pypy2
+service: hello-pypy311
 
 
 provider:
@@ -6,11 +6,11 @@ provider:
   region: eu-central-1
 
 functions:
-  hello-pypy2:
+  hello-pypy311:
     handler: hello.handler
-    runtime: provided
-    # Use `AWS_ACCOUNT=$(aws sts get-caller-identity | jq -r .Account) sls deploy` to deploy
-    # (or replace the following with your account id)
+    runtime: provided.al2023
+    # Set PYPY_LAYER_ARN before deploy, for example:
+    # PYPY_LAYER_ARN=$(aws lambda list-layer-versions --layer-name pypy311 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
     layers:
-      - arn:aws:lambda:eu-central-1:${env:AWS_ACCOUNT}:layer:pypy:2
+      - ${env:PYPY_LAYER_ARN}
 

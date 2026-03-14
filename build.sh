@@ -12,7 +12,7 @@ cd layer
 PKG_NAME=${PYPY_VERSION}-linux64
 BZIP_FILE=${PKG_NAME}.tar.bz2
 if [ ! -f "$BZIP_FILE" ]; then
-    curl -OL https://bitbucket.org/pypy/pypy/downloads/${BZIP_FILE}
+    curl -OL https://downloads.python.org/pypy/${BZIP_FILE}
 fi
 cd ${PYPY_VERSION}
 tar -xvjf ../${BZIP_FILE}

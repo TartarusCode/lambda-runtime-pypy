@@ -1,113 +1,138 @@
 # lambda-runtime-pypy
 
-An AWS Lambda Runtime for [PyPy](http://pypy.org) with enhanced error handling and logging.
+An AWS Lambda custom runtime layer for [PyPy](https://pypy.org) on `provided.al2023`.
 
 Derived from https://github.com/iopipe/lambda-runtime-pypy3.5
 
 ## Overview
 
-This is an AWS Lambda Runtime for PyPy that provides a high-performance Python runtime for AWS Lambda functions. It uses [portable-pypy](https://github.com/squeaky-pl/portable-pypy), which is a statically-linked distribution of PyPy.
+This project packages a PyPy runtime as a Lambda layer and ships a hardened `bootstrap` that:
 
-## Features
+- Implements the Lambda Runtime API with correct `/next`, `/response`, `/error`, and `/init/error` lifecycle behavior.
+- Handles `SIGTERM` and `SIGINT` so the runtime can stop polling and exit cleanly.
+- Reports structured error payloads including stack traces.
+- Publishes helper modules for structured logging, optional X-Ray integration, and Provisioned Concurrency init hooks.
 
-- **High Performance**: PyPy's JIT compiler provides significant performance improvements for CPU-intensive workloads
-- **Enhanced Error Handling**: Comprehensive error reporting and logging
-- **Type Safety**: Full type hints throughout the codebase
-- **Robust Logging**: Structured logging with configurable levels
-- **Input Validation**: Thorough validation of environment variables and handler configuration
-- **Resource Management**: Proper cleanup and resource management
+## Supported Runtime
 
-## Benefits of PyPy
+- `pypy3.11-v7.3.21`
+- Lambda runtime target: `provided.al2023`
 
-- **Faster Execution**: JIT compilation can provide 2-10x speed improvements for certain workloads
-- **Memory Efficiency**: Better memory usage patterns for long-running functions
-- **Compatibility**: Full compatibility with Python standard library and most packages
+Python 2 and the legacy `provided` runtime are intentionally no longer built or published.
 
 ## Build
 
-To build this runtime as a layer:
+Build the runtime layer:
 
 ```bash
 make build
 ```
 
+Security checks:
+
+```bash
+make audit
+```
+
+The build pipeline now:
+
+- Downloads PyPy over HTTPS with retries.
+- Verifies the downloaded archive against the pinned SHA-256 checksum in `checksums/pypy.sha256`.
+- Copies the runtime helper package into the layer's `site-packages`.
+- Runs a best-effort vulnerability scan when `trivy` or `grype` is installed.
+
+## Publish
+
+Upload and publish the layer:
+
+```bash
+make upload
+make publish
+```
+
+Published layer versions are marked as compatible with `provided.al2023`.
+
 ## Usage
 
-### Basic Lambda Function
+### Basic Handler
 
 ```python
 def handler(event, context):
-    """Example Lambda handler using PyPy runtime."""
     return {
-        'statusCode': 200,
-        'body': 'Hello from PyPy Lambda!'
+        "statusCode": 200,
+        "body": "Hello from PyPy Lambda!",
     }
 ```
 
-### Performance Optimization
+### Structured Logging
 
 ```python
-import json
-from typing import Dict, Any
+from lambda_runtime_pypy import get_logger
 
-def handler(event: Dict[str, Any], context) -> Dict[str, Any]:
-    """
-    Optimized handler for PyPy runtime.
-    
-    Args:
-        event: Lambda event data
-        context: Lambda context object
-        
-    Returns:
-        Response dictionary
-    """
-    # PyPy's JIT will optimize this loop
-    result = sum(i * i for i in range(1000))
-    
-    return {
-        'statusCode': 200,
-        'body': json.dumps({'result': result})
-    }
+logger = get_logger("app", service="orders")
+
+
+def handler(event, context):
+    logger.info("handling request")
+    return {"statusCode": 200, "body": "ok"}
 ```
 
-## Configuration
+### Optional Init Hooks
 
-### Environment Variables
+```python
+from lambda_runtime_pypy import register_init_hook
 
-- `AWS_LAMBDA_RUNTIME_API`: Runtime API endpoint (automatically set)
-- `_HANDLER`: Handler function specification (e.g., "app.handler")
 
-### Handler Format
+@register_init_hook
+def warm_dependencies():
+    import json
+    json.dumps({"warm": True})
+```
 
-The handler should be specified in the format `module.function`:
-- `module`: Python module path (e.g., "app" or "src.handlers.api")
-- `function`: Function name within the module
+You can also register hooks through the `PYPY_RUNTIME_INIT_HOOKS` environment variable using a comma-separated list of `module.function` references.
 
-## Best Practices
+### Optional X-Ray Helper
 
-1. **Use Type Hints**: Leverage PyPy's type checking capabilities
-2. **Optimize Loops**: PyPy's JIT excels at optimizing loops and numerical computations
-3. **Warm Up**: Consider warm-up invocations for JIT compilation
-4. **Memory Management**: PyPy has different memory patterns - monitor usage
-5. **Error Handling**: Use structured logging for better debugging
+```python
+from lambda_runtime_pypy import subsegment
 
-## Performance Considerations
 
-- **Cold Start**: PyPy may have slightly longer cold starts due to JIT compilation
-- **Memory Usage**: Monitor memory usage as PyPy's GC differs from CPython
-- **JIT Warm-up**: First few invocations may be slower as JIT compiles hot code paths
+def handler(event, context):
+    with subsegment("load-order", annotations={"tenant": "demo"}):
+        return {"statusCode": 200, "body": "ok"}
+```
 
-## Troubleshooting
+If `aws_xray_sdk` is not present, the helper becomes a no-op so application code does not need branching logic.
 
-### Common Issues
+## Handler Resolution
 
-1. **Import Errors**: Ensure all dependencies are included in the deployment package
-2. **Memory Limits**: Monitor memory usage, especially for long-running functions
-3. **Timeout Issues**: PyPy may need more time for JIT compilation
+Handlers use the standard `module.function` format and now support nested modules correctly, for example:
 
-### Logging
+- `app.handler`
+- `src.handlers.api.handler`
 
-The runtime provides structured logging. Check CloudWatch logs for detailed execution information.
+## Performance Notes
+
+- PyPy can improve warm execution performance for CPU-heavy functions.
+- Cold starts can be slower than CPython because of JIT warm-up.
+- For latency-sensitive workloads, pair this runtime with Provisioned Concurrency and keep init hooks focused on reusable work only.
+
+## Local Build Shell
+
+For a local shell that matches the Lambda base runtime more closely:
+
+```bash
+make shell
+```
+
+This uses `public.ecr.aws/sam/build-provided.al2023`.
+
+## Examples
+
+- `examples/sam/template.yml`
+- `examples/sls/serverless.yml`
+
+Both examples now target `provided.al2023` and expect you to supply the published layer ARN for your account and region.
 
 ## License
 

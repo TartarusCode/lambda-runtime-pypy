@@ -10,4 +10,5 @@ deploy: package
 		--template-file packaged.yml \
 		--stack-name pypy-example-sam \
 		--capabilities CAPABILITY_IAM \
+		--parameter-overrides PyPyLayerArn=$$PYPY_LAYER_ARN \
 		--region us-east-1

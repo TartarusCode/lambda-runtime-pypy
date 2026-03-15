@@ -1,6 +1,11 @@
 SHELL=/bin/bash
 
 PYPY_VERSIONS := pypy3.11-v7.3.21
+LOCAL_TEMPLATE := examples/sam/template.local.example.yaml
+LOCAL_EVENT := examples/sam/events/hello.json
+LOCAL_LAYER_DIR := .local-layer
+LOCAL_BUILD_TEMPLATE := .aws-sam/build/template.yaml
+LOCAL_AWS_ENV := env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_SESSION_TOKEN=test AWS_REGION=us-east-1
 
 all: clean build upload publish
 
@@ -11,7 +16,7 @@ PUBLICIZE_TARGETS := $(foreach pypy,$(PYPY_VERSIONS),publicize-$(pypy))
 LATEST_TARGETS := $(foreach pypy,$(PYPY_VERSIONS),latest-$(pypy))
 AUDIT_TARGETS := $(foreach pypy,$(PYPY_VERSIONS),audit-$(pypy))
 
-.PHONY: all clean build upload publish publicize latest audit $(UPLOAD_TARGETS) $(PUBLISH_TARGETS) $(PUBLICIZE_TARGETS) $(LATEST_TARGETS) $(AUDIT_TARGETS) shell
+.PHONY: all clean build upload publish publicize latest audit local-layer local-build local-invoke $(UPLOAD_TARGETS) $(PUBLISH_TARGETS) $(PUBLICIZE_TARGETS) $(LATEST_TARGETS) $(AUDIT_TARGETS) shell
 
 $(BUILD_TARGETS): %.zip:
 	PYPY_VERSION="$*" ./build.sh
@@ -42,6 +47,17 @@ publicize: $(PUBLICIZE_TARGETS)
 latest: $(LATEST_TARGETS)
 
 audit: $(AUDIT_TARGETS)
+
+local-layer: $(firstword $(BUILD_TARGETS))
+	rm -rf "$(LOCAL_LAYER_DIR)"
+	mkdir -p "$(LOCAL_LAYER_DIR)"
+	unzip -q "$(firstword $(BUILD_TARGETS))" -d "$(LOCAL_LAYER_DIR)"
+
+local-build: local-layer
+	sam build --template-file "$(LOCAL_TEMPLATE)" --use-container
+
+local-invoke: local-build
+	$(LOCAL_AWS_ENV) sam local invoke HelloFunction --template-file "$(LOCAL_BUILD_TEMPLATE)" --event "$(LOCAL_EVENT)"
 
 clean:
 	rm -rf layer $(BUILD_TARGETS)

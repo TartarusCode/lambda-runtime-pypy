@@ -12,3 +12,9 @@ deploy: package
 		--capabilities CAPABILITY_IAM \
 		--parameter-overrides PyPyLayerArn=$$PYPY_LAYER_ARN \
 		--region us-east-1
+
+local-build:
+	$(MAKE) -C ../.. local-build
+
+local-invoke:
+	$(MAKE) -C ../.. local-invoke

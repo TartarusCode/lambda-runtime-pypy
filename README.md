@@ -127,12 +127,39 @@ make shell
 
 This uses `public.ecr.aws/sam/build-provided.al2023`.
 
+## Local SAM Test Flow
+
+The repo now includes a repeatable local invoke setup for Docker-backed SAM:
+
+- Template: `examples/sam/template.local.example.yaml`
+- Sample event: `examples/sam/events/hello.json`
+- Function build file: `examples/sam/hello/Makefile`
+
+From the repo root:
+
+```bash
+make local-build
+make local-invoke
+```
+
+What these targets do:
+
+- `make local-build` builds the PyPy layer zip, unpacks it into `.local-layer`, and runs `sam build --use-container`.
+- `make local-invoke` runs the built function through `sam local invoke` using dummy AWS credentials so expired local profiles do not block testing.
+
+Requirements:
+
+- Run from WSL/Linux for the smoothest Docker behavior.
+- Ensure Docker is available in your shell.
+- Ensure `sam` is installed in the environment where you run the local test commands.
+
 ## Examples
 
 - `examples/sam/template.yml`
+- `examples/sam/template.local.example.yaml`
 - `examples/sls/serverless.yml`
 
-Both examples now target `provided.al2023` and expect you to supply the published layer ARN for your account and region.
+The deployable examples target `provided.al2023` and expect you to supply the published layer ARN for your account and region. The local SAM example uses the locally unpacked `.local-layer` directory instead.
 
 ## License
 
